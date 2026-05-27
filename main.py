@@ -71,8 +71,19 @@ def cmd_backtest(args):
     from src.backtest.walk_forward import run_walk_forward_backtest, compute_backtest_metrics, print_backtest_report
     from src.backtest.metrics import full_validation_report
     features = pd.read_parquet(PROCESSED_DIR / "features.parquet")
+
+    historical_odds = pd.DataFrame()
+    if args.real_odds:
+        from src.data.fetch_historical_odds import load_historical_odds_for_seasons
+        print("Loading real historical odds...")
+        historical_odds = load_historical_odds_for_seasons(TEST_SEASONS)
+        if historical_odds.empty:
+            print("No historical odds available — falling back to synthetic lines.")
+            print("To enable: subscribe to The Odds API Starter plan (~$19/month)")
+            print("           or run: python main.py import-odds --csv <path>")
+
     print("Running walk-forward backtest...")
-    bets = run_walk_forward_backtest(features)
+    bets = run_walk_forward_backtest(features, historical_odds=historical_odds)
     if not bets.empty:
         metrics = compute_backtest_metrics(bets)
         print_backtest_report(metrics)
@@ -80,6 +91,26 @@ def cmd_backtest(args):
         bets.to_parquet(PROCESSED_DIR / "backtest_results.parquet", index=False)
     else:
         print("No bets met the EV threshold — try lowering MIN_EV_THRESHOLD in config.py")
+
+
+def cmd_import_odds(args):
+    """Imports historical odds from a CSV file and caches as parquet."""
+    import pandas as pd
+    from src.data.fetch_historical_odds import load_odds_from_csv, HISTORICAL_ODDS_DIR
+
+    HISTORICAL_ODDS_DIR.mkdir(parents=True, exist_ok=True)
+    odds = load_odds_from_csv(args.csv)
+    if odds.empty:
+        print("No odds loaded — check CSV format.")
+        return
+
+    # Split by season and cache each year
+    odds["season"] = odds["game_date"].dt.year
+    for season, group in odds.groupby("season"):
+        out = HISTORICAL_ODDS_DIR / f"odds_{season}.parquet"
+        group.drop(columns=["season"]).to_parquet(out, index=False)
+        print(f"  Cached {len(group)} rows → {out.name}")
+    print(f"Done. Run 'python main.py backtest --real-odds' to use these lines.")
 
 
 def cmd_picks(args):
@@ -98,7 +129,15 @@ def main():
                         help="Skip weather fetching (much faster, less accurate)")
 
     sub.add_parser("train", help="Train the Poisson GLM on training seasons")
-    sub.add_parser("backtest", help="Run walk-forward backtest")
+
+    bt_p = sub.add_parser("backtest", help="Run walk-forward backtest")
+    bt_p.add_argument(
+        "--real-odds", action="store_true",
+        help="Use real historical closing lines (requires The Odds API paid plan or prior import-odds run)"
+    )
+
+    import_p = sub.add_parser("import-odds", help="Import historical odds from a CSV file")
+    import_p.add_argument("--csv", required=True, help="Path to CSV with historical odds")
 
     picks_p = sub.add_parser("picks", help="Generate today's bet recommendations")
     picks_p.add_argument("--date", type=str, default=None, help="Date: YYYY-MM-DD (default: today)")
@@ -115,6 +154,7 @@ def main():
         "train": cmd_train,
         "backtest": cmd_backtest,
         "picks": cmd_picks,
+        "import-odds": cmd_import_odds,
     }
 
     if args.command == "all":

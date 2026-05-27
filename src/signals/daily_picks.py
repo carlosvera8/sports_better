@@ -70,22 +70,48 @@ def get_season_averages(features: pd.DataFrame, season: int) -> pd.DataFrame:
     return team_avg
 
 
-def fetch_todays_starters() -> dict[str, dict]:
+def fetch_todays_starters(target_date: str = None) -> dict[str, str]:
     """
-    Fetches today's probable starters from Baseball Reference via pybaseball.
-    Returns dict: {team_abbr: {"name": str, "hand": str}}
-    Falls back to None if unavailable (model will use team average).
+    Returns {team_abbr: pitcher_fullname} for today's probable starters.
+    Uses the free MLB Stats API (no auth required).
+    Falls back to empty dict — model will use team season average.
     """
+    if target_date is None:
+        target_date = date.today().isoformat()
     try:
-        import pybaseball as pb
-        today = date.today().strftime("%Y-%m-%d")
-        # pybaseball doesn't have a direct probable starters endpoint,
-        # but we can use the schedule to get announced starters.
-        # For a production system, Baseball Reference or MLB Stats API is more reliable.
-        # This is a placeholder — integrate MLB Stats API for accurate daily starters.
-        print("  Note: Probable starter lookup not fully automated yet.")
-        print("  For best results, manually set starter names in the feature overrides.")
-        return {}
+        import requests
+        from src.data.fetch_games import TEAM_ID_TO_ABBR
+
+        resp = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={
+                "sportId": 1,
+                "date": target_date,
+                "gameType": "R",
+                "hydrate": "probablePitchers",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+
+        starters = {}
+        for date_entry in resp.json().get("dates", []):
+            for game in date_entry.get("games", []):
+                for side in ["home", "away"]:
+                    team_block = game.get("teams", {}).get(side, {})
+                    team_id = team_block.get("team", {}).get("id")
+                    pitcher = team_block.get("probablePitcher")
+                    if team_id and pitcher:
+                        abbr = TEAM_ID_TO_ABBR.get(team_id)
+                        if abbr:
+                            starters[abbr] = pitcher.get("fullName", "")
+
+        n = len(starters)
+        if n:
+            print(f"  Probable starters announced for {n} teams")
+        else:
+            print("  No starters announced yet — using team season averages")
+        return starters
     except Exception as e:
         print(f"  Could not fetch starters: {e}")
         return {}
@@ -96,16 +122,23 @@ def build_today_features(
     historical_features: pd.DataFrame,
     pitcher_data: pd.DataFrame,
     target_date: str = None,
+    starters: dict = None,
 ) -> pd.DataFrame:
     """
     Constructs the feature row for each game happening today.
-    Merges odds, weather, and historical averages.
+    Merges odds, weather, historical averages, and announced starters.
+
+    starters: {team_abbr: pitcher_fullname} from fetch_todays_starters().
+              When provided, uses the announced starter's individual quality score
+              instead of the team's season-average top-2 starters.
     """
     from src.data.fetch_pitchers import get_pitcher_quality_features
     from src.models.poisson_model import add_derived_features
 
     if target_date is None:
         target_date = date.today().isoformat()
+    if starters is None:
+        starters = {}
 
     current_season = int(target_date[:4])
     team_offense_avg = get_season_averages(historical_features, current_season)
@@ -115,6 +148,7 @@ def build_today_features(
     if pd.isna(league_avg_pq):
         league_avg_pq = 4.0
 
+    # Team-season average (fallback when no announced starter or starter not in DB)
     sp_lookup = (
         pitcher_quality[
             (pitcher_quality["Season"] == current_season) & (pitcher_quality["GS"] >= 5)
@@ -126,6 +160,10 @@ def build_today_features(
         .mean()
         .to_dict()
     )
+
+    # Individual pitcher lookup: (season, name) → quality score
+    # Also check prior season for pitchers who changed teams or aren't in current-year DB yet
+    pq_by_name = pitcher_quality.set_index(["Season", "Name"])["pitcher_quality"].to_dict()
 
     # Deduplicate to one row per game (consensus across books) for feature building
     from src.data.fetch_odds import build_consensus_line
@@ -154,9 +192,19 @@ def build_today_features(
         home_offense = team_offense_avg.get(home, 4.5)
         away_offense = team_offense_avg.get(away, 4.5)
 
-        # Pitcher quality
-        home_pq = sp_lookup.get(home, league_avg_pq)
-        away_pq = sp_lookup.get(away, league_avg_pq)
+        # Pitcher quality — announced starter takes priority over team average
+        home_starter = starters.get(home, "")
+        away_starter = starters.get(away, "")
+        home_pq = (
+            pq_by_name.get((current_season, home_starter))
+            or pq_by_name.get((current_season - 1, home_starter))
+            or sp_lookup.get(home, league_avg_pq)
+        )
+        away_pq = (
+            pq_by_name.get((current_season, away_starter))
+            or pq_by_name.get((current_season - 1, away_starter))
+            or sp_lookup.get(away, league_avg_pq)
+        )
 
         # Park factor
         park_factor = FALLBACK_PARK_FACTORS.get(home, 100) / 100.0
@@ -171,6 +219,8 @@ def build_today_features(
             "season": current_season,
             "home_team": home,
             "away_team": away,
+            "home_starter": home_starter or "(team avg)",
+            "away_starter": away_starter or "(team avg)",
             "home_offense_rate": home_offense,
             "away_offense_rate": away_offense,
             "home_pitcher_quality": home_pq,
@@ -233,9 +283,13 @@ def run_daily_picks(target_date: str = None, bankroll: float = 1000.0):
 
     print(f"Found {len(odds)} games with odds.")
 
+    # Fetch today's announced starters
+    print("Fetching today's probable starters...")
+    starters = fetch_todays_starters(target_date)
+
     # Build features for today's games
     print("Building features + fetching weather...")
-    today_features = build_today_features(odds_raw, historical, pitchers, target_date)
+    today_features = build_today_features(odds_raw, historical, pitchers, target_date, starters)
 
     if today_features.empty:
         print("Could not build features for today's games.")
@@ -281,8 +335,8 @@ def run_daily_picks(target_date: str = None, bankroll: float = 1000.0):
 
     # Show all games
     print(f"\n  ALL GAMES TODAY")
-    print(f"  {'Matchup':<30} {'Line':<6} {'P(O)':<8} {'P(U)':<8} {'EV_O':>7} {'EV_U':>7}")
-    print(f"  {'-'*65}")
+    print(f"  {'Matchup':<30} {'Line':<6} {'P(O)':<8} {'P(U)':<8} {'EV_O':>7} {'EV_U':>7}  Starters (away / home)")
+    print(f"  {'-'*95}")
     for _, g_row in today_features.iterrows():
         home = g_row["home_team"]
         away = g_row["away_team"]
@@ -296,7 +350,9 @@ def run_daily_picks(target_date: str = None, bankroll: float = 1000.0):
         p_u = ev_under_row.iloc[0]["model_prob"]
         ev_o = ev_over_row.iloc[0]["ev"]
         ev_u = ev_under_row.iloc[0]["ev"]
-        print(f"  {matchup:<30} {line:<6.1f} {p_o:<8.3f} {p_u:<8.3f} {ev_o:>+7.3f} {ev_u:>+7.3f}")
+        away_sp = g_row.get("away_starter", "(team avg)")
+        home_sp = g_row.get("home_starter", "(team avg)")
+        print(f"  {matchup:<30} {line:<6.1f} {p_o:<8.3f} {p_u:<8.3f} {ev_o:>+7.3f} {ev_u:>+7.3f}  {away_sp} / {home_sp}")
 
     # Show flagged bets
     summarize_edge(ev_table)

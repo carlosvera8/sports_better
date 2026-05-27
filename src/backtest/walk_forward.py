@@ -58,6 +58,7 @@ def simulate_bet_outcome(
 
 def run_walk_forward_backtest(
     features: pd.DataFrame,
+    historical_odds: pd.DataFrame = None,
     train_seasons: list[int] = None,
     test_seasons: list[int] = None,
     ev_threshold: float = MIN_EV_THRESHOLD,
@@ -65,16 +66,19 @@ def run_walk_forward_backtest(
     default_line: float = 8.5,
     default_over_odds: int = -110,
     default_under_odds: int = -110,
-    use_odds_from_features: bool = False,
 ) -> pd.DataFrame:
     """
     Runs a walk-forward backtest.
 
-    If use_odds_from_features=False (default), uses fixed -110/-110 odds as a baseline.
-    This is valid for backtesting model edge independently of line shopping.
+    historical_odds: optional DataFrame from fetch_historical_odds.py with columns
+        (game_date, home_team, away_team, total_line, over_odds, under_odds).
+        When provided, each game uses its real market line and odds instead of the
+        fixed defaults. Games without a matched line fall back to the defaults.
 
     Returns a DataFrame of all simulated bets with outcomes.
     """
+    from src.data.fetch_historical_odds import merge_historical_odds
+
     if train_seasons is None:
         train_seasons = TRAIN_SEASONS
     if test_seasons is None:
@@ -85,7 +89,6 @@ def run_walk_forward_backtest(
     bankroll_history = [bankroll]
 
     for test_season in test_seasons:
-        # Train on all seasons strictly before test_season
         current_train_seasons = [s for s in train_seasons if s < test_season]
         if not current_train_seasons:
             print(f"No training data before {test_season}, skipping")
@@ -101,17 +104,24 @@ def run_walk_forward_backtest(
         print(f"\nTraining on {current_train_seasons[0]}–{current_train_seasons[-1]} "
               f"({len(train_df)} games), testing on {test_season} ({len(test_df)} games)...")
 
+        # Merge real odds into test data if available
+        season_odds = pd.DataFrame()
+        if historical_odds is not None and not historical_odds.empty:
+            season_odds = historical_odds[
+                historical_odds["game_date"].dt.year == test_season
+            ].copy()
+        test_df = merge_historical_odds(test_df, season_odds)
+
         model = PoissonTotalsModel()
         model.fit(train_df)
 
-        # Predict on test set
-        lines = np.full(len(test_df), default_line)
+        lines = test_df["total_line"].values
         p_over, p_under = model.predict_over_under_probs(test_df, lines)
 
         for i, (_, row) in enumerate(test_df.iterrows()):
-            line = default_line
-            over_odds = default_over_odds
-            under_odds = default_under_odds
+            line = row["total_line"]
+            over_odds = int(row["over_odds"])
+            under_odds = int(row["under_odds"])
             actual_total = row["total_runs"]
 
             for side, model_p, odds in [("OVER", p_over[i], over_odds),
@@ -121,7 +131,7 @@ def run_walk_forward_backtest(
                     continue
 
                 stake = kelly_stake(model_p, odds, bankroll, kelly_fraction)
-                if stake < 1.0:  # minimum bet $1
+                if stake < 1.0:
                     continue
 
                 pnl = simulate_bet_outcome(side, line, actual_total, odds, stake)
