@@ -27,7 +27,7 @@ from config import PROCESSED_DIR, RAW_DIR, MIN_EV_THRESHOLD, KELLY_FRACTION
 from src.data.fetch_odds import fetch_live_odds, build_consensus_line
 from src.data.fetch_weather import fetch_forecast_weather, STADIUMS
 from src.features.park_factors import FALLBACK_PARK_FACTORS
-from src.features.build_features import temperature_effect as _temp_effect
+from src.models.poisson_model import temperature_effect as _temp_effect
 from src.models.poisson_model import PoissonTotalsModel
 from src.models.ev_calculator import compute_ev_table, summarize_edge
 
@@ -102,7 +102,7 @@ def build_today_features(
     Merges odds, weather, and historical averages.
     """
     from src.data.fetch_pitchers import get_pitcher_quality_features
-    from src.features.build_features import add_derived_features
+    from src.models.poisson_model import add_derived_features
 
     if target_date is None:
         target_date = date.today().isoformat()
@@ -127,8 +127,24 @@ def build_today_features(
         .to_dict()
     )
 
+    # Deduplicate to one row per game (consensus across books) for feature building
+    from src.data.fetch_odds import build_consensus_line
+    consensus = build_consensus_line(odds_df)
+    # Re-attach per-game odds columns needed downstream
+    best_odds = (
+        odds_df.sort_values("vig")  # lowest vig = best line
+        .groupby(["home_team", "away_team"])
+        .first()
+        .reset_index()[["home_team", "away_team", "total_line", "over_odds", "under_odds",
+                         "fair_prob_over", "fair_prob_under"]]
+    )
+    consensus = consensus.merge(
+        best_odds[["home_team", "away_team", "over_odds", "under_odds"]],
+        on=["home_team", "away_team"], how="left"
+    )
+
     rows = []
-    for _, odds_row in odds_df.iterrows():
+    for _, odds_row in consensus.iterrows():
         raw_home = odds_row.get("home_team", "")
         raw_away = odds_row.get("away_team", "")
         home = ODDS_API_TEAM_MAP.get(raw_home, raw_home)
@@ -229,14 +245,41 @@ def run_daily_picks(target_date: str = None, bankroll: float = 1000.0):
     lines = today_features["total_line"].values
     p_over, p_under = model.predict_over_under_probs(today_features, lines)
 
-    # Compute EV table
-    ev_table = compute_ev_table(today_features, p_over, p_under, odds_raw)
+    # Build EV table directly from today_features (which already has odds embedded)
+    # This avoids the team-name mismatch between odds_raw (full names) and features (abbrs)
+    from src.models.ev_calculator import expected_value, kelly_stake
+    ev_rows = []
+    for i, (_, row) in enumerate(today_features.iterrows()):
+        for side, model_p, odds_col in [
+            ("OVER",  p_over[i],  "over_odds"),
+            ("UNDER", p_under[i], "under_odds"),
+        ]:
+            odds = int(row.get(odds_col, -110))
+            market_p = row.get(f"fair_prob_{side.lower()}", 0.5)
+            ev = expected_value(model_p, odds)
+            stake = kelly_stake(model_p, odds, bankroll, KELLY_FRACTION)
+            ev_rows.append({
+                "game_date":  row.get("game_date"),
+                "matchup":    f"{row['away_team']} @ {row['home_team']}",
+                "home_team":  row["home_team"],
+                "away_team":  row["away_team"],
+                "side":       side,
+                "line":       row.get("total_line", 0),
+                "odds":       odds,
+                "model_prob": round(model_p, 4),
+                "market_prob": round(market_p, 4),
+                "ev":         round(ev, 4),
+                "kelly_fraction_of_bankroll": round(stake, 4),
+                "clv":        round(model_p - market_p, 4),
+                "flag_bet":   ev >= MIN_EV_THRESHOLD,
+            })
+    ev_table = pd.DataFrame(ev_rows).sort_values("ev", ascending=False).reset_index(drop=True)
 
     if ev_table.empty:
         print("No EV data computed.")
         return
 
-    # Show all games first
+    # Show all games
     print(f"\n  ALL GAMES TODAY")
     print(f"  {'Matchup':<30} {'Line':<6} {'P(O)':<8} {'P(U)':<8} {'EV_O':>7} {'EV_U':>7}")
     print(f"  {'-'*65}")
@@ -244,11 +287,6 @@ def run_daily_picks(target_date: str = None, bankroll: float = 1000.0):
         home = g_row["home_team"]
         away = g_row["away_team"]
         matchup = f"{away} @ {home}"
-        idx_list = [i for i, (_, er) in enumerate(ev_table.iterrows())
-                    if er["home_team"] == home and er["side"] == "OVER"]
-        if not idx_list:
-            continue
-        idx = idx_list[0]
         ev_over_row = ev_table[(ev_table["home_team"] == home) & (ev_table["side"] == "OVER")]
         ev_under_row = ev_table[(ev_table["home_team"] == home) & (ev_table["side"] == "UNDER")]
         if ev_over_row.empty or ev_under_row.empty:

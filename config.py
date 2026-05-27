@@ -17,7 +17,7 @@ WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
 # 2020 excluded: COVID-shortened 60-game season played in empty stadiums.
 # It's a structural outlier (no home field effect, compressed rosters) that hurts model generalization.
 TRAIN_SEASONS = [2015, 2016, 2017, 2018, 2019, 2021]
-TEST_SEASONS = [2022, 2023, 2024]
+TEST_SEASONS = [2022, 2023, 2024, 2025]
 
 # Minimum EV threshold to flag a bet (3%)
 MIN_EV_THRESHOLD = 0.03
