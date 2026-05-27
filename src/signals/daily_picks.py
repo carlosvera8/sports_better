@@ -295,6 +295,10 @@ def run_daily_picks(target_date: str = None, bankroll: float = 1000.0):
         print("Could not build features for today's games.")
         return
 
+    # Archive today's odds — builds real historical dataset over time (free tier)
+    from src.data.fetch_historical_odds import archive_todays_odds
+    archive_todays_odds(today_features)
+
     # Get model probabilities
     lines = today_features["total_line"].values
     p_over, p_under = model.predict_over_under_probs(today_features, lines)

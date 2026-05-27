@@ -161,6 +161,7 @@ def main():
         cmd_fetch(args)
         cmd_features(args)
         cmd_train(args)
+        args.real_odds = False
         cmd_backtest(args)
     elif args.command in dispatch:
         dispatch[args.command](args)
